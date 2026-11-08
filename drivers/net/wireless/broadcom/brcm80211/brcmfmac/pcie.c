@@ -10,6 +10,7 @@
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-map-ops.h>
 #include <linux/interrupt.h>
 #include <linux/bcma/bcma.h>
 #include <linux/sched.h>
@@ -18,6 +19,10 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/random.h>
+#include <linux/of.h>
+#include <linux/of_reserved_mem.h>
+#include <linux/swiotlb.h>
+#include <linux/sizes.h>
 #include <linux/unaligned.h>
 
 #include <soc.h>
@@ -117,6 +122,11 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_4387_CHIP_ID, 0xFFFFFFFF, 4387C2), /* revision ID 7 */
 	BRCMF_FW_ENTRY(BRCM_CC_4389_CHIP_ID, 0xFFFFFFFF, 4389C1),
 };
+
+static bool chip_only;
+module_param(chip_only, bool, 0444);
+MODULE_PARM_DESC(chip_only,
+		 "Bluejay diagnostic: identify chip without core setup or firmware");
 
 #define BRCMF_PCIE_FW_UP_TIMEOUT		5000 /* msec */
 
@@ -1671,6 +1681,15 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 				BRCMF_NROF_H2D_COMMON_MSGRINGS;
 		max_completionrings = BRCMF_NROF_D2H_COMMON_MSGRINGS;
 	}
+	if (max_submissionrings < BRCMF_NROF_H2D_COMMON_MSGRINGS ||
+	    max_submissionrings < max_flowrings + BRCMF_NROF_H2D_COMMON_MSGRINGS ||
+	    max_submissionrings > 1024 ||
+	    max_completionrings < BRCMF_NROF_D2H_COMMON_MSGRINGS ||
+	    max_completionrings > 64) {
+		brcmf_err(bus, "invalid ring index counts: %u/%u/%u\n",
+			  max_flowrings, max_submissionrings, max_completionrings);
+		return -EIO;
+	}
 	if (max_flowrings > 512) {
 		brcmf_err(bus, "invalid max_flowrings(%d)\n", max_flowrings);
 		return -EIO;
@@ -2284,13 +2303,57 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
 }
 
 
+static int brcmf_pcie_bluejay_dma_guard(struct device *dev)
+{
+#if IS_ENABLED(CONFIG_DMA_RESTRICTED_POOL)
+	struct device_node *np;
+	struct reserved_mem *rmem;
+	struct io_tlb_mem *mem = dev->dma_io_tlb_mem;
+	bool valid;
+
+	if (!of_device_is_compatible(dev->of_node, "brcm,bcm4329-fmac"))
+		return -ENODEV;
+	np = of_parse_phandle(dev->of_node, "memory-region", 0);
+	if (!np)
+		return -ENODEV;
+	rmem = of_reserved_mem_lookup(np);
+	valid = of_device_is_available(np) &&
+		of_device_is_compatible(np, "restricted-dma-pool") &&
+		!get_dma_ops(dev) && !dev->dma_range_map &&
+		!dma_get_min_align_mask(dev) &&
+		rmem && rmem->base == 0xc4000000 && rmem->size == SZ_64M &&
+		mem && rmem->priv == mem && mem->for_alloc && mem->force_bounce &&
+		mem->defpool.start == rmem->base &&
+		mem->defpool.end == rmem->base + rmem->size;
+	of_node_put(np);
+#ifdef CONFIG_SWIOTLB_DYNAMIC
+	valid = valid && !mem->can_grow;
+#endif
+	if (!valid)
+		return -EINVAL;
+	dev_info(dev, "Bluejay restricted DMA attachment verified: 64 MiB below 4 GiB\n");
+	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
 static int brcmf_pcie_get_resource(struct brcmf_pciedev_info *devinfo)
 {
 	struct pci_dev *pdev = devinfo->pdev;
 	struct brcmf_bus *bus = dev_get_drvdata(&pdev->dev);
 	int err;
+	u64 mask = DMA_BIT_MASK(64);
 	phys_addr_t  bar0_addr, bar1_addr;
 	ulong bar1_size;
+
+	if (of_machine_is_compatible("google,gs101-bluejay")) {
+		mask = DMA_BIT_MASK(32);
+		err = brcmf_pcie_bluejay_dma_guard(&pdev->dev);
+		if (err)
+			return dev_err_probe(&pdev->dev, err,
+					     "refusing unconfined Bluejay DMA\n");
+	}
 
 	err = pci_enable_device(pdev);
 	if (err) {
@@ -2298,14 +2361,12 @@ static int brcmf_pcie_get_resource(struct brcmf_pciedev_info *devinfo)
 		return err;
 	}
 
-	pci_set_master(pdev);
-
 	/* The dongle takes 64-bit host addresses in every ring and buffer
 	 * descriptor. Without this the PCI default 32-bit mask applies, and
 	 * every allocation from a restricted DMA pool placed above 4 GiB
 	 * fails.
 	 */
-	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	err = dma_set_mask_and_coherent(&pdev->dev, mask);
 	if (err) {
 		err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 		if (err) {
@@ -2313,6 +2374,8 @@ static int brcmf_pcie_get_resource(struct brcmf_pciedev_info *devinfo)
 			return err;
 		}
 	}
+
+	pci_set_master(pdev);
 
 	/* Bar-0 mapped address */
 	bar0_addr = pci_resource_start(pdev, 0);
@@ -2427,6 +2490,19 @@ static int brcmf_pcie_buscore_reset(void *ctx, struct brcmf_chip *chip)
 }
 
 
+static int brcmf_pcie_buscore_identify(void *ctx, u32 chip, u32 chiprev)
+{
+	struct brcmf_pciedev_info *devinfo = ctx;
+
+	if (!chip_only)
+		return 0;
+
+	dev_info(&devinfo->pdev->dev,
+		 "Bluejay chip-only: chip=%u revision=%u; no core setup or firmware\n",
+		 chip, chiprev);
+	return -ECANCELED;
+}
+
 static void brcmf_pcie_buscore_activate(void *ctx, struct brcmf_chip *chip,
 					u32 rstvec)
 {
@@ -2438,6 +2514,7 @@ static void brcmf_pcie_buscore_activate(void *ctx, struct brcmf_chip *chip,
 
 static const struct brcmf_buscore_ops brcmf_pcie_buscore_ops = {
 	.prepare = brcmf_pcie_buscoreprep,
+	.identify = brcmf_pcie_buscore_identify,
 	.reset = brcmf_pcie_buscore_reset,
 	.activate = brcmf_pcie_buscore_activate,
 	.read32 = brcmf_pcie_buscore_read32,
@@ -3005,6 +3082,12 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct brcmf_core *core;
 	struct brcmf_bus *bus;
 
+	if (chip_only &&
+	    (!of_machine_is_compatible("google,gs101-bluejay") ||
+	     pdev->vendor != PCI_VENDOR_ID_BROADCOM ||
+	     pdev->device != BRCM_PCIE_4389_DEVICE_ID))
+		return -EOPNOTSUPP;
+
 	if (!id) {
 		id = pci_match_id(brcmf_pcie_devid_table, pdev);
 		if (!id) {
@@ -3128,7 +3211,8 @@ fail_bus:
 	kfree(bus->msgbuf);
 	kfree(bus);
 fail:
-	brcmf_err(NULL, "failed %x:%x\n", pdev->vendor, pdev->device);
+	if (!chip_only || ret != -ECANCELED)
+		brcmf_err(NULL, "failed %x:%x\n", pdev->vendor, pdev->device);
 	brcmf_pcie_release_resource(devinfo);
 	if (devinfo->ci)
 		brcmf_chip_detach(devinfo->ci);
@@ -3136,6 +3220,9 @@ fail:
 		brcmf_release_module_param(devinfo->settings);
 	kfree(pcie_bus_dev);
 	kfree(devinfo);
+	if (chip_only && ret == -ECANCELED)
+		dev_info(&pdev->dev,
+			 "Bluejay chip-only cleanup complete; not binding\n");
 	return ret;
 }
 

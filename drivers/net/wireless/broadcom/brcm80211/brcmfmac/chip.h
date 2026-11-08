@@ -58,6 +58,8 @@ struct brcmf_core {
  * @read32: read 32-bit value over bus.
  * @write32: write 32-bit value over bus.
  * @prepare: prepare bus for core configuration.
+ * @identify: optional chip identification callback before core enumeration;
+ *	return a negative error to stop before core setup.
  * @setup: bus-specific core setup.
  * @active: chip becomes active.
  *	The callback should use the provided @rstvec when non-zero.
@@ -66,6 +68,7 @@ struct brcmf_buscore_ops {
 	u32 (*read32)(void *ctx, u32 addr);
 	void (*write32)(void *ctx, u32 addr, u32 value);
 	int (*prepare)(void *ctx);
+	int (*identify)(void *ctx, u32 chip, u32 chiprev);
 	int (*reset)(void *ctx, struct brcmf_chip *chip);
 	int (*setup)(void *ctx, struct brcmf_chip *chip);
 	void (*activate)(void *ctx, struct brcmf_chip *chip, u32 rstvec);

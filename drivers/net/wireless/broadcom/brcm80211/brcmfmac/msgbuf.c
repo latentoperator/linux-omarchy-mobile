@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/of.h>
 #include <linux/unaligned.h>
 
 #include <brcmu_utils.h>
@@ -365,6 +366,10 @@ brcmf_msgbuf_alloc_pktid(struct device *dev,
 {
 	struct brcmf_msgbuf_pktid *array;
 	u32 count;
+
+	if (of_machine_is_compatible("google,gs101-bluejay") &&
+	    (data_offset > skb->len || skb->len - data_offset > 8192))
+		return -E2BIG;
 
 	array = pktids->array;
 
@@ -848,6 +853,11 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 			bphy_err(drvr, "No SKB, but qlen %d\n",
 				 brcmf_flowring_qlen(flow, flowid));
 			break;
+		}
+		if (of_machine_is_compatible("google,gs101-bluejay") &&
+		    skb->len > 8192 - BRCMF_MSGBUF_SFH_LLC_LEN) {
+			brcmu_pkt_buf_free_skb(skb);
+			continue;
 		}
 		skb_orphan(skb);
 		memcpy(ethhdr, skb->data, ETH_HLEN);

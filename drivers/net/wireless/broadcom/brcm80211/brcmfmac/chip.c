@@ -1036,6 +1036,12 @@ static int brcmf_chip_recognition(struct brcmf_chip_priv *ci)
 	brcmf_dbg(INFO, "found %s chip: %s\n",
 		  socitype == SOCI_SB ? "SB" : "AXI", ci->pub.name);
 
+	if (ci->ops->identify) {
+		ret = ci->ops->identify(ci->ctx, ci->pub.chip, ci->pub.chiprev);
+		if (ret < 0)
+			return ret;
+	}
+
 	if (socitype == SOCI_SB) {
 		if (ci->pub.chip != BRCM_CC_4329_CHIP_ID) {
 			brcmf_err("SB chip is not supported\n");
