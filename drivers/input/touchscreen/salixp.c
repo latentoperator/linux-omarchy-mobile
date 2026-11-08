@@ -5,7 +5,10 @@
  * SALIXP is the FTS part whose hardware id is 36 40. Google's GPL FTM5
  * driver (kernel/google-modules/touch/fts_touch), Copyright (C) 2016
  * STMicroelectronics, calls that id SALIXP. Chip id 36 48 is ALIX and is
- * not this part. This driver sends four things: a hardware-register
+ * a separately matched part. ALIX defaults to resource discovery only;
+ * alix_stage selects later identity, system-info and input gates. Device
+ * core pinctrl and SPI-controller setup precede the peripheral probe.
+ * This driver sends four things: a hardware-register
  * read (opcode 0xfb), a framebuffer read (opcode 0xa7), a FIFO read
  * (opcode 0x87), and one scan command (0xa0 0x00 0xff). It also
  * toggles the reset GPIO once, after the system-info read. It never
@@ -111,12 +114,21 @@
 #define SALIXP_EVT_MOTION	0x23
 #define SALIXP_EVT_LEAVE	0x33
 
+/* ALIX bring-up is opt-in per load; SALIXP keeps its existing behaviour. */
+static unsigned int alix_stage;
+module_param(alix_stage, uint, 0444);
+MODULE_PARM_DESC(alix_stage,
+		 "ALIX: 0 resources, 1 identity, 2 CRC/system info, 3 input");
+
 struct salixp_info {
 	u8 id[2];
+	const char *name;
+	bool staged;
 };
 
 struct salixp {
 	struct spi_device *spi;
+	const struct salixp_info *info;
 	struct gpio_desc *reset;
 	struct input_dev *input;
 	struct touchscreen_properties prop;
@@ -138,7 +150,48 @@ struct salixp {
 
 static const struct salixp_info salixp_info = {
 	.id = { 0x36, 0x40 },
+	.name = "SALIXP Touchscreen",
 };
+
+static const struct salixp_info alix_info = {
+	.id = { 0x36, 0x48 },
+	.name = "ALIX Touchscreen",
+	.staged = true,
+};
+
+/*
+ * Google's touch_bus_negotiator uses physical zero for AP ownership on
+ * both GPIOs and a 500 ms request timeout. Both descriptors are active low,
+ * so an asserted request/ack is physical zero. Poll the acknowledgment here;
+ * the bring-up driver never starts AoC or requests its interrupt.
+ */
+static int alix_request_bus(struct device *dev)
+{
+	struct gpio_desc *request, *ack;
+	ktime_t deadline;
+	int value;
+
+	ack = devm_gpiod_get(dev, "bus-ack", GPIOD_IN);
+	if (IS_ERR(ack))
+		return dev_err_probe(dev, PTR_ERR(ack), "getting bus ack\n");
+	request = devm_gpiod_get(dev, "bus-request", GPIOD_OUT_HIGH);
+	if (IS_ERR(request))
+		return dev_err_probe(dev, PTR_ERR(request), "requesting AP bus\n");
+
+	deadline = ktime_add_ms(ktime_get(), 500);
+	do {
+		value = gpiod_get_value_cansleep(ack);
+		if (value < 0)
+			return value;
+		if (value) {
+			dev_info(dev, "ALIX AP bus acknowledged\n");
+			return 0;
+		}
+		usleep_range(1000, 2000);
+	} while (ktime_before(ktime_get(), deadline));
+
+	return dev_err_probe(dev, -ETIMEDOUT, "AP bus not acknowledged\n");
+}
 
 static void salixp_assert_reset(void *data)
 {
@@ -617,7 +670,8 @@ static int salixp_suspend(struct device *dev)
 {
 	struct salixp *ts = spi_get_drvdata(to_spi_device(dev));
 
-	disable_delayed_work_sync(&ts->poll_work);
+	if (ts->input)
+		disable_delayed_work_sync(&ts->poll_work);
 	return 0;
 }
 
@@ -625,8 +679,10 @@ static int salixp_resume(struct device *dev)
 {
 	struct salixp *ts = spi_get_drvdata(to_spi_device(dev));
 
-	enable_delayed_work(&ts->poll_work);
-	queue_delayed_work(system_freezable_wq, &ts->poll_work, 0);
+	if (ts->input) {
+		enable_delayed_work(&ts->poll_work);
+		queue_delayed_work(system_freezable_wq, &ts->poll_work, 0);
+	}
 	return 0;
 }
 
@@ -648,7 +704,7 @@ static int salixp_register_input(struct salixp *ts)
 	if (!input)
 		return -ENOMEM;
 
-	input->name = "SALIXP Touchscreen";
+	input->name = ts->info->name;
 	input->id.bustype = BUS_SPI;
 
 	/*
@@ -684,13 +740,35 @@ static int salixp_probe(struct spi_device *spi)
 	info = device_get_match_data(dev);
 	if (!info)
 		return -ENODEV;
+	if (info->staged && alix_stage > 3)
+		return dev_err_probe(dev, -EINVAL, "invalid ALIX stage\n");
 
 	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
 	if (!ts)
 		return -ENOMEM;
 
 	ts->spi = spi;
+	ts->info = info;
 	spi_set_drvdata(spi, ts);
+
+	if (info->staged) {
+		struct regulator *supply;
+
+		/* No enable vote, GPIO direction change or SPI transaction. */
+		supply = devm_regulator_get(dev, "vdd");
+		if (IS_ERR(supply))
+			return dev_err_probe(dev, PTR_ERR(supply), "getting vdd\n");
+		supply = devm_regulator_get(dev, "avdd");
+		if (IS_ERR(supply))
+			return dev_err_probe(dev, PTR_ERR(supply), "getting avdd\n");
+		if (!alix_stage) {
+			dev_info(dev, "ALIX stage 0: no driver GPIO/power/SPI actions\n");
+			return 0;
+		}
+		ret = alix_request_bus(dev);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * Assert reset before either rail. Cover rails are S2MPG12 LDO25M
@@ -729,6 +807,10 @@ static int salixp_probe(struct spi_device *spi)
 		ret = salixp_read_id(ts, id);
 		if (!ret && id[0] == info->id[0] && id[1] == info->id[1]) {
 			dev_info(dev, "chip id %02x %02x\n", id[0], id[1]);
+			if (info->staged && alix_stage == 1) {
+				dev_info(dev, "ALIX stage 1: identity only\n");
+				return 0;
+			}
 			ret = salixp_read_crc(ts, &crc_raw, &crc_status);
 			if (ret)
 				return dev_err_probe(dev, ret, "reading crc status\n");
@@ -741,6 +823,10 @@ static int salixp_probe(struct spi_device *spi)
 			if (ret)
 				return dev_err_probe(dev, ret,
 						     "system info would repair\n");
+			if (info->staged && alix_stage == 2) {
+				dev_info(dev, "ALIX stage 2: CRC/system info only\n");
+				return 0;
+			}
 			ret = salixp_poll_cx(ts);
 			if (ret)
 				return dev_err_probe(dev, ret, "cx poll would repair\n");
@@ -765,12 +851,14 @@ static int salixp_probe(struct spi_device *spi)
 
 static const struct of_device_id salixp_of_match[] = {
 	{ .compatible = "st,salixp", .data = &salixp_info },
+	{ .compatible = "st,alix", .data = &alix_info },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, salixp_of_match);
 
 static const struct spi_device_id salixp_id[] = {
 	{ "salixp", 0 },
+	{ "alix", 0 },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, salixp_id);

@@ -8,6 +8,7 @@
 
 #include <linux/array_size.h>
 #include <linux/clk.h>
+#include <linux/ioport.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -45,6 +46,25 @@
 #define USI_CON_RESET		BIT(0)
 #define USI_OPTION_CLKREQ_ON	BIT(1)
 #define USI_OPTION_CLKSTOP_ON	BIT(2)
+
+/* Keep one controller unconfigured until a guarded manual bind. */
+static unsigned long probe_hold_base;
+module_param(probe_hold_base, ulong, 0644);
+MODULE_PARM_DESC(probe_hold_base,
+		 "Hold the USI resource base before probe configuration (0 disables)");
+
+static bool exynos_usi_probe_held(struct platform_device *pdev)
+{
+	unsigned long hold = READ_ONCE(probe_hold_base);
+	struct resource *res;
+
+	if (!hold)
+		return false;
+
+	/* Resource metadata only: no clocks, regmap, mapping or register read. */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	return res && res->start == hold;
+}
 
 enum exynos_usi_ver {
 	USI_VER1 = 0,
@@ -291,6 +311,11 @@ static int exynos_usi_probe(struct platform_device *pdev)
 	struct device_node *np = dev->of_node;
 	struct exynos_usi *usi;
 	int ret;
+
+	if (exynos_usi_probe_held(pdev)) {
+		dev_info(dev, "probe held before configuration\n");
+		return -ECANCELED;
+	}
 
 	usi = devm_kzalloc(dev, sizeof(*usi), GFP_KERNEL);
 	if (!usi)
