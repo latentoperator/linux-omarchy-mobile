@@ -38,7 +38,9 @@
 #include <linux/pci-pwrctrl.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/regmap.h>
+#include <linux/regulator/consumer.h>
 
 #include "pcie-designware.h"
 
@@ -178,6 +180,10 @@ struct gs201_pcie {
 	int clks_on;
 	struct phy *phy;
 	struct gpio_desc *perst;
+	bool gs101;
+	struct regulator_bulk_data supplies[2];
+	bool supplies_on;
+	struct gpio_desc *wlan_enable;
 	bool coherent;
 	bool phy_inited;
 	bool phy_on;
@@ -490,6 +496,14 @@ static int gs201_pcie_stage_clocks(struct gs201_pcie *gp)
 	u32 opt;
 	int ret;
 
+	if (gp->gs101 && !gp->supplies_on) {
+		gs201_trace(gp, "enable PCIe1 LDO17/LDO19 supplies");
+		ret = regulator_bulk_enable(ARRAY_SIZE(gp->supplies), gp->supplies);
+		if (ret)
+			return ret;
+		gp->supplies_on = true;
+	}
+
 	if (gp->cmu) {
 		gs201_trace(gp, "about to read CMU_HSI2 CONTROLLER_OPTION (0x14400800)");
 		opt = readl(gp->cmu + GS201_CMU_OPTION);
@@ -699,17 +713,30 @@ static void gs201_pcie_bringdown(struct gs201_pcie *gp)
 		gp->phy_inited = false;
 	}
 	gs201_pcie_clocks_off(gp);
+	if (gp->gs101 && gp->wlan_enable)
+		gpiod_set_value_cansleep(gp->wlan_enable, 0);
+	if (gp->supplies_on) {
+		int ret;
+
+		gs201_trace(gp, "release PCIe1 supply votes");
+		ret = regulator_bulk_disable(ARRAY_SIZE(gp->supplies), gp->supplies);
+		if (ret)
+			dev_err(gp->pci.dev, "supply release failed: %d\n", ret);
+		else
+			gp->supplies_on = false;
+	}
 }
 
 static int gs201_pcie_start_link(struct dw_pcie *pci)
 {
 	struct gs201_pcie *gp = to_gs201_pcie(pci);
 	struct device *dev = pci->dev;
+	unsigned int tries = gp->gs101 ? 1 : GS201_LINK_TRIES;
 	unsigned int try;
 	u32 val;
 	int ret;
 
-	for (try = 1; try <= GS201_LINK_TRIES; try++) {
+	for (try = 1; try <= tries; try++) {
 		gs201_trace(gp, "link try %u: about to write ELBI 0x054 = 1 and poll 0x2c8 for L0 (48 ms)",
 			    try);
 		gs201_elbi_writel(gp, GS201_ELBI_LTSSM_EN, 1);
@@ -725,7 +752,9 @@ static int gs201_pcie_start_link(struct dw_pcie *pci)
 		dev_warn(dev, "link training failed (try %u), LTSSM %#lx\n",
 			 try, FIELD_GET(GS201_ELBI_LTSSM_STATE_MASK, val));
 
-		if (try == GS201_LINK_TRIES) {
+		if (try == tries) {
+			if (gp->gs101)
+				return ret;
 			gs201_pcie_dump_history(gp);
 			break;
 		}
@@ -809,15 +838,21 @@ static int gs201_pcie_host_init(struct dw_pcie_rp *pp)
 	dev_info(dev, "stage %u/%u: %s\n", GS201_STAGE_LINK, GS201_STAGE_LINK,
 		 gs201_stage_names[GS201_STAGE_LINK]);
 
+	if (gp->gs101) {
+		gs201_trace(gp, "WLAN REG_ON high, wait 200 ms");
+		gpiod_set_value_cansleep(gp->wlan_enable, 1);
+		msleep(200);
+	}
+
 	/* Endpoint power (WL_REG_ON) through pwrctrl, before the PHY config */
-	if (!pci->suspended) {
+	if (!gp->gs101 && !pci->suspended) {
 		gs201_trace(gp, "about to create the pwrctrl device for the root port");
 		ret = pci_pwrctrl_create_devices(dev);
 		if (ret)
 			goto err_unchain;
 	}
 
-	if (!pp->skip_pwrctrl_off) {
+	if (!gp->gs101 && !pp->skip_pwrctrl_off) {
 		gs201_trace(gp, "about to power the endpoint (WL_REG_ON, gph2-4, 200 ms)");
 		ret = pci_pwrctrl_power_on_devices(dev);
 		if (ret)
@@ -1043,6 +1078,10 @@ static int gs201_pcie_get_cmu(struct gs201_pcie *gp)
 	struct resource res;
 	int ret;
 
+	/* gs101 has holes in the gs201 CMU gate range (including 0x20e0). */
+	if (gp->gs101)
+		return 0;
+
 	cmu_np = of_parse_phandle(dev->of_node, "samsung,cmu", 0);
 	if (!cmu_np)
 		return 0;
@@ -1100,6 +1139,11 @@ static int gs201_pcie_probe(struct platform_device *pdev)
 	if (!gp)
 		return -ENOMEM;
 
+	gp->gs101 = of_device_is_compatible(np, "google,gs101-pcie");
+	if (gp->gs101 && (cmu_acg_off || of_dma_is_coherent(np)))
+		return dev_err_probe(dev, -EINVAL,
+				     "gs101 needs noncoherent DMA and no CMU override\n");
+
 	raw_spin_lock_init(&gp->lock);
 
 	pci = &gp->pci;
@@ -1153,6 +1197,18 @@ static int gs201_pcie_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(gp->perst),
 				     "failed to get PERST# GPIO\n");
 
+	if (gp->gs101) {
+		if (!of_property_present(np, "vpcie0v85-supply") ||
+		    !of_property_present(np, "vpcie1v8-supply"))
+			return dev_err_probe(dev, -EINVAL, "missing PCIe1 supplies\n");
+		gp->supplies[0].supply = "vpcie0v85";
+		gp->supplies[1].supply = "vpcie1v8";
+		ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(gp->supplies),
+					      gp->supplies);
+		if (ret)
+			return dev_err_probe(dev, ret, "PCIe1 supplies unavailable\n");
+	}
+
 	/* The DWC core reads num-lanes in host_init; stages need it earlier */
 	if (of_property_read_u32(np, "num-lanes", &pci->num_lanes))
 		pci->num_lanes = 1;
@@ -1161,6 +1217,20 @@ static int gs201_pcie_probe(struct platform_device *pdev)
 
 	if (stop_after < GS201_STAGE_LINK)
 		return gs201_pcie_staged_probe(gp);
+
+	if (gp->gs101) {
+		struct pinctrl *pins;
+
+		gs201_trace(gp, "select WLAN pin state for link stage");
+		pins = devm_pinctrl_get_select(dev, "wlan");
+		if (IS_ERR(pins))
+			return PTR_ERR(pins);
+		gs201_trace(gp, "request WLAN REG_ON low for link stage");
+		gp->wlan_enable = devm_gpiod_get(dev, "enable", GPIOD_OUT_LOW);
+		if (IS_ERR(gp->wlan_enable))
+			return dev_err_probe(dev, PTR_ERR(gp->wlan_enable),
+					     "WLAN REG_ON unavailable\n");
+	}
 
 	ret = gs201_pcie_init_irq(gp, pdev);
 	if (ret)
@@ -1187,6 +1257,7 @@ static void gs201_pcie_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id gs201_pcie_of_match[] = {
+	{ .compatible = "google,gs101-pcie" },
 	{ .compatible = "google,gs201-pcie" },
 	{ }
 };

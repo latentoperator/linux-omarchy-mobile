@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/pci/google,gs201-pcie.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Google gs201 PCIe host controller
+title: Google gs101 / gs201 PCIe host controller
 
 maintainers:
   - Derek Ross <derekross@gmail.com>
@@ -20,10 +20,20 @@ description:
 allOf:
   - $ref: /schemas/pci/pci-host-bridge.yaml#
   - $ref: /schemas/pci/snps,dw-pcie-common.yaml#
+  - if:
+      properties:
+        compatible:
+          const: google,gs101-pcie
+    then:
+      properties:
+        dma-coherent: false
+        samsung,cmu: false
 
 properties:
   compatible:
-    const: google,gs201-pcie
+    enum:
+      - google,gs101-pcie
+      - google,gs201-pcie
 
   reg:
     minItems: 3
@@ -73,6 +83,16 @@ properties:
           - description: offset of this controller's shareability register
     description:
       Needed with dma-coherent, to make the controller's DMA shareable.
+
+  vpcie0v85-supply:
+    description: PCIe analog 0.85 V supply.
+
+  vpcie1v8-supply:
+    description: PCIe analog 1.8 V supply.
+
+  enable-gpios:
+    maxItems: 1
+    description: WLAN REG_ON, driven only for the explicit link stage.
 
   num-lanes:
     maximum: 2
