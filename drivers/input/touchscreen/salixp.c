@@ -6,15 +6,14 @@
  * driver (kernel/google-modules/touch/fts_touch), Copyright (C) 2016
  * STMicroelectronics, calls that id SALIXP. Chip id 36 48 is ALIX and is
  * a separately matched part. ALIX negotiates AP bus ownership before reset,
- * supply enable or SPI traffic. Device
- * core pinctrl and SPI-controller setup precede the peripheral probe.
- * This driver sends four things: a hardware-register
- * read (opcode 0xfb), a framebuffer read (opcode 0xa7), a FIFO read
- * (opcode 0x87), and one scan command (0xa0 0x00 0xff). It also
- * asserts reset before enabling supplies, then releases it before identity checks. It never
- * sends opcode 0xfa, a flash or config write, a system or load
- * command, or the setScanMode preamble. It does not request the
- * interrupt. Attention is level low. After reset is released the line
+ * supply enable or SPI traffic. Device core pinctrl and SPI-controller setup
+ * precede the peripheral probe. Both variants assert reset before enabling
+ * vdd then avdd, and release reset before checking identity.
+ * This driver sends four things: a hardware-register read (opcode 0xfb), a
+ * framebuffer read (opcode 0xa7), a FIFO read (opcode 0x87), and one scan
+ * command (0xa0 0x00 0xff). It never sends opcode 0xfa, a flash or config
+ * write, a system or load command, or the setScanMode preamble. It does not
+ * request the interrupt. Attention is level low. After reset is released the line
  * falls and stays low, so a level interrupt would storm before any
  * firmware handshake.
  *
