@@ -42,6 +42,7 @@
 #include <linux/mutex.h>
 #include <linux/soc/google/gs201-aoc-sysmmu.h>
 #include <linux/soc/google/gsa.h>
+#include <linux/soc/google/gs201-aoc.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 
@@ -65,6 +66,16 @@ DEFINE_MUTEX(aoc_service_lock);
 enum AOC_FW_STATE aoc_state;
 
 struct platform_device *aoc_platform_device;
+
+bool gs201_aoc_firmware_online(const struct device_node *np)
+{
+	struct platform_device *pdev = READ_ONCE(aoc_platform_device);
+
+	/* No MMIO or access to the protected firmware carve-out. */
+	return pdev && pdev->dev.of_node == np &&
+		READ_ONCE(aoc_state) == AOC_STATE_ONLINE;
+}
+EXPORT_SYMBOL_GPL(gs201_aoc_firmware_online);
 
 /* TODO: Reduce the global variables (move into a driver structure) */
 /* Resources found from the device tree */
