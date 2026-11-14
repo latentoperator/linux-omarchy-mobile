@@ -2837,10 +2837,15 @@ static int aoc_platform_probe(struct platform_device *pdev)
 			goto err_watchdog_iommu_irq;
 		}
 	}
-	prvdata->chipid_virt =
-		devm_platform_ioremap_resource_byname(pdev, "chipid");
-	if (IS_ERR(prvdata->chipid_virt)) {
-		rc = PTR_ERR(prvdata->chipid_virt);
+	/* exynos-chipid owns this read-only range; do not claim it again. */
+	rsrc = platform_get_resource_byname(pdev, IORESOURCE_MEM, "chipid");
+	if (!rsrc) {
+		rc = -EINVAL;
+		goto err_watchdog_iommu_irq;
+	}
+	prvdata->chipid_virt = devm_ioremap(dev, rsrc->start, resource_size(rsrc));
+	if (!prvdata->chipid_virt) {
+		rc = -ENOMEM;
 		goto err_watchdog_iommu_irq;
 	}
 	aoc_chipid_virt = prvdata->chipid_virt;
