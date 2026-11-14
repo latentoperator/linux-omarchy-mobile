@@ -22,6 +22,14 @@ description:
   the controller interrupt by a child interrupt controller.
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: google,gs201-lynx-pcie
+    then:
+      required:
+        - google,aoc
   - $ref: /schemas/pci/pci-host-bridge.yaml#
   - $ref: /schemas/pci/snps,dw-pcie-common.yaml#
   - if:
@@ -45,6 +53,14 @@ properties:
       - items:
           - const: google,zumapro-pcie
           - const: google,zuma-pcie
+      - items:
+          - const: google,gs201-lynx-pcie
+          - const: google,gs201-pcie
+
+  google,aoc:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      AoC whose firmware must be online before powering the WLAN endpoint.
 
   reg:
     minItems: 3
