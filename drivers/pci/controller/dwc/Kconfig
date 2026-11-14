@@ -422,6 +422,7 @@ config PCIE_GS201
 	tristate "Google gs201 PCIe controller (host mode)"
 	depends on OF && (ARCH_EXYNOS || COMPILE_TEST)
 	depends on PCI_MSI
+	depends on GS201_AOC || !GS201_AOC
 	select PCIE_DW_HOST
 	select PCI_PWRCTRL_GENERIC
 	help
