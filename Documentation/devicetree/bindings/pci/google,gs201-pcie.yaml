@@ -45,6 +45,14 @@ properties:
       - items:
           - const: google,zumapro-pcie
           - const: google,zuma-pcie
+      - items:
+          - const: google,gs201-lynx-pcie
+          - const: google,gs201-pcie
+
+  google,aoc:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      AoC whose firmware must be online before powering the WLAN endpoint.
 
   reg:
     minItems: 3
